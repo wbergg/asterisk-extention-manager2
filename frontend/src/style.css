@@ -1,0 +1,239 @@
+@import "tailwindcss";
+
+/*
+ * Instrument-panel palette, in two themes.
+ *
+ * One dominant field with status as the only saturated colour on the page.
+ * Nothing decorative is coloured — if something is green, amber or red it is
+ * telling you the state of a PBX.
+ *
+ * The colours live in two layers:
+ *
+ *   `@theme inline` below binds each Tailwind utility to a raw `--aem-*`
+ *   variable rather than to a literal, so `bg-panel-950` compiles to
+ *   `var(--aem-panel-950)`. The themes then only have to re-point those raw
+ *   variables and the whole GUI follows — no component knows a theme exists.
+ *
+ * `inline` is load-bearing: without it Tailwind would emit
+ * `var(--color-panel-950)`, adding a hop whose value is fixed on `:root` and
+ * cannot be re-pointed per theme.
+ */
+@theme inline {
+  --color-panel-950: var(--aem-panel-950);
+  --color-panel-900: var(--aem-panel-900);
+  --color-panel-850: var(--aem-panel-850);
+  --color-panel-800: var(--aem-panel-800);
+  --color-panel-700: var(--aem-panel-700);
+  --color-panel-600: var(--aem-panel-600);
+
+  --color-ink-100: var(--aem-ink-100);
+  --color-ink-300: var(--aem-ink-300);
+  --color-ink-500: var(--aem-ink-500);
+
+  --color-ok-400: var(--aem-ok-400);
+  --color-ok-900: var(--aem-ok-900);
+  --color-warn-400: var(--aem-warn-400);
+  --color-warn-900: var(--aem-warn-900);
+  --color-bad-400: var(--aem-bad-400);
+  --color-bad-900: var(--aem-bad-900);
+  --color-idle-400: var(--aem-idle-400);
+  --color-idle-900: var(--aem-idle-900);
+
+  --color-accent-400: var(--aem-accent-400);
+  --color-accent-900: var(--aem-accent-900);
+
+  /* Identity, not state: the wordmark only. Kept apart from `accent` so the
+     brand can be loud without implying "this is interactive". */
+  --color-brand-400: var(--aem-brand-400);
+
+  --font-mono:
+    ui-monospace, "JetBrains Mono", "SF Mono", "Cascadia Mono", Menlo,
+    Consolas, monospace;
+  --font-sans:
+    system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+}
+
+/* Any future `dark:` utility should follow the switch, not the OS — the
+   attribute is the single source of truth for which theme is showing. */
+@custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
+
+/*
+ * Dark — the default, and the theme this tool was designed in.
+ *
+ * Also the fallback: it is on bare `:root`, so a browser that never runs the
+ * boot script in index.html still gets a complete palette.
+ */
+:root {
+  --aem-panel-950: #0a0c10;
+  --aem-panel-900: #0f131a;
+  --aem-panel-850: #141923;
+  --aem-panel-800: #1a2029;
+  --aem-panel-700: #252c38;
+  --aem-panel-600: #363f4e;
+
+  --aem-ink-100: #e8ecf2;
+  --aem-ink-300: #a7b0c0;
+  --aem-ink-500: #6b7686;
+
+  --aem-ok-400: #4ade80;
+  --aem-ok-900: #0d2818;
+  --aem-warn-400: #fbbf24;
+  --aem-warn-900: #2a1f05;
+  --aem-bad-400: #f87171;
+  --aem-bad-900: #2c1113;
+  --aem-idle-400: #64748b;
+  --aem-idle-900: #1a1f28;
+
+  --aem-accent-400: #38bdf8;
+  --aem-accent-900: #082f3e;
+
+  --aem-brand-400: #e8ecf2;
+
+  /* Rack-panel banding — light lines scored into a dark field. */
+  --aem-band: rgba(255, 255, 255, 0.012);
+  --aem-shadow: rgba(0, 0, 0, 0.55);
+  --aem-scrim: rgba(3, 5, 8, 0.8);
+
+  color-scheme: dark;
+}
+
+/*
+ * Light — the Anderstorpsfestivalen palette.
+ *
+ * Sampled from the festival logo — a white ground, near-black type, and the
+ * crimson of the logo's frame (#e2224a) as the brand mark.
+ *
+ * The panel greys carry the faint cool cast of the logo's pale-blue blocks, so
+ * the chrome belongs to the same artwork rather than reading as neutral grey.
+ *
+ * The scale inverts in lightness but keeps every role: `panel-950` is still
+ * the page ground and `panel-600` still the strongest border — which is why
+ * 600 is *darker* than 700 here and lighter than it in dark mode.
+ *
+ * Status hues are the logo's own green and red, deepened until each clears
+ * 4.5:1 both on the white ground and on its own tinted `-900` background.
+ */
+[data-theme="light"] {
+  --aem-panel-950: #ffffff;
+  --aem-panel-900: #f7f9fc;
+  --aem-panel-850: #eef2f8;
+  --aem-panel-800: #e6ecf4;
+  --aem-panel-700: #d3dceb;
+  --aem-panel-600: #b9c5d8;
+
+  --aem-ink-100: #10151c;
+  --aem-ink-300: #45505f;
+  --aem-ink-500: #5d6879;
+
+  --aem-ok-400: #0a7d39;
+  --aem-ok-900: #e6f6ec;
+  --aem-warn-400: #8a6a00;
+  --aem-warn-900: #fdf6d5;
+  --aem-bad-400: #c81e26;
+  --aem-bad-900: #fdeaea;
+  --aem-idle-400: #5b6675;
+  --aem-idle-900: #eef1f5;
+
+  --aem-accent-400: #1a5fce;
+  --aem-accent-900: #e9f1fd;
+
+  --aem-brand-400: #e2224a;
+
+  /* Same banding, inverted: dark lines scored into a white field. */
+  --aem-band: rgba(0, 0, 0, 0.022);
+  --aem-shadow: rgba(16, 21, 28, 0.16);
+  --aem-scrim: rgba(16, 21, 28, 0.45);
+
+  color-scheme: light;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+}
+
+body {
+  background: var(--color-panel-950);
+  color: var(--color-ink-100);
+  font-family: var(--font-sans);
+  /* Faint vertical banding, like a rack panel. Barely visible; stops the
+     background reading as flat dead space. */
+  background-image: repeating-linear-gradient(
+    90deg,
+    var(--aem-band) 0px,
+    var(--aem-band) 1px,
+    transparent 1px,
+    transparent 120px
+  );
+}
+
+/* Technical identifiers are always monospace: operators scan and compare
+   extension numbers, SEP ids and revisions, and proportional digits make that
+   measurably harder. */
+.ident {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+}
+
+/* Lift for the few things that float over the page (toasts, dialogs). The
+   colour is themed: a shadow that reads as depth on near-black is a smudge on
+   white. */
+.elev {
+  box-shadow:
+    0 10px 24px -6px var(--aem-shadow),
+    0 2px 6px -2px var(--aem-shadow);
+}
+
+/* Dialogs, which sit above a scrim and need to separate from it. */
+.elev-hi {
+  box-shadow:
+    0 24px 60px -12px var(--aem-shadow),
+    0 8px 20px -8px var(--aem-shadow);
+}
+
+/* The veil behind a dialog. Always a *darkening* — in light mode the page and
+   the dialog are both near-white, so a tinted-white scrim would leave nothing
+   between them. */
+.scrim {
+  background-color: var(--aem-scrim);
+}
+
+::selection {
+  background: var(--color-accent-900);
+  color: var(--color-ink-100);
+}
+
+*:focus-visible {
+  outline: 2px solid var(--color-accent-400);
+  outline-offset: 2px;
+}
+
+/* Scrollbars that belong to the panel rather than the OS. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-panel-700) transparent;
+}
+
+@keyframes aem-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+/* Reserved for live state only — a converged PBX with a current heartbeat.
+   Motion here means "this is happening now", nowhere else. */
+.live-dot {
+  animation: aem-pulse 2.4s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .live-dot {
+    animation: none;
+  }
+}

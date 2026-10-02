@@ -1,0 +1,74 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "aem",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-01",
+  "compatibility_flags": ["nodejs_compat"],
+
+  "observability": {
+    "enabled": true
+  },
+
+  // A custom domain (not a workers.dev subdomain) is required: Cloudflare
+  // Access can only protect a hostname in a zone on this account, and Access
+  // is the portal's entire authentication model.
+  "routes": [
+    {
+      "pattern": "aem.example.com",
+      "custom_domain": true
+    }
+  ],
+
+  // The admin SPA. Built to public/ by the frontend toolchain.
+  // run_worker_first is required: the Worker must see these before the static
+  // asset handler claims them. /directory.xml especially — with SPA
+  // not_found_handling the asset handler answers unknown paths with index.html,
+  // so a Cisco phone would receive the SPA instead of the phonebook XML.
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "run_worker_first": ["/api/*", "/pbx/*", "/directory.xml"],
+    "not_found_handling": "single-page-application"
+  },
+
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "PBX",
+        "class_name": "PbxController"
+      }
+    ]
+  },
+
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["PbxController"]
+    }
+  ],
+
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "aem",
+      "database_id": "REPLACE_WITH_D1_DATABASE_ID",
+      "migrations_dir": "migrations"
+    }
+  ],
+
+  "vars": {
+    // Cloudflare Access application audience tag. Set per environment.
+    "ACCESS_AUD": "REPLACE_WITH_ACCESS_AUD",
+    // Your Access team domain, e.g. "example.cloudflareaccess.com".
+    "ACCESS_TEAM_DOMAIN": "example.cloudflareaccess.com",
+    // Set to "1" only for local development: bypasses Access JWT verification
+    // and treats every request as the DEV_ADMIN_EMAIL user.
+    "DEV_AUTH_BYPASS": "0",
+    "DEV_ADMIN_EMAIL": "dev@localhost"
+  }
+
+  // Secrets (set with `wrangler secret put <NAME>`):
+  //   SECRET_KEY  - base64 32-byte AES-GCM key used to encrypt extension
+  //                 secrets at rest in D1. Decrypted only inside the DO.
+  //   BUNDLE_KEY  - base64 32-byte HMAC key used to sign config bundles.
+}

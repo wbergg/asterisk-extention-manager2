@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>aem · asterisk extension manager</title>
+    <script>
+      // Runs before first paint so a light-mode user never sees a dark flash.
+      // The app boots behind an identity fetch, so the wrong theme would
+      // otherwise be on screen for the whole round trip.
+      //
+      // Mirrors frontend/src/theme.ts — same key, same "dark unless light"
+      // default. Keep the two in step.
+      try {
+        var t = localStorage.getItem("aem.theme");
+        if (t === "light") document.documentElement.dataset.theme = "light";
+      } catch (e) {
+        // Blocked site data — the markup default (dark) stands.
+      }
+    </script>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
