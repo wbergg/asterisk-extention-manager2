@@ -28,6 +28,8 @@ import {
 const REQUEST_TIMEOUT_MS = 20_000;
 /** Background drift sweep cadence. Also acts as the reconcile watchdog. */
 const SWEEP_INTERVAL_MS = 60 * 60 * 1000;
+/** Op-log rows read per delta page; a pass keeps paging until it reaches its head. */
+const DELTA_PAGE = 5000;
 /** Consecutive failures before an object is quarantined and skipped. */
 const QUARANTINE_AFTER = 5;
 
@@ -66,6 +68,13 @@ export class PbxController extends DurableObject<Env> {
    *  an orphaned response is dropped and the alarm restarts the reconcile. */
   private pending = new Map<string, PendingRequest>();
   private reconciling = false;
+  /**
+   * A trigger arrived while a pass was running. The running pass read its
+   * snapshot before the change committed, so it cannot be relied on to pick it
+   * up; another pass is scheduled the moment it finishes. In memory only: if
+   * the DO is evicted the pass dies with it and the watchdog alarm restarts.
+   */
+  private rerunRequested = false;
   private reqCounter = 0;
 
   constructor(ctx: DurableObjectState, env: Env) {
@@ -178,7 +187,9 @@ export class PbxController extends DurableObject<Env> {
     // PBX kept the state we last acked, which AstDB does across an Asterisk
     // restart — but not across a re-image, an AstDB wipe, or a restore from
     // backup. Without this the DO would report "converged" over an empty box.
-    this.setMeta("needs_sweep", "1");
+    // A fresh token per connect, so a pass already running against the old
+    // socket cannot clear this connection's request when it finishes.
+    this.setMeta("needs_sweep", crypto.randomUUID());
 
     // Keep the previous error visible until this attempt produces its own
     // verdict, so the status view never goes blank mid-reconnect.
@@ -396,6 +407,9 @@ export class PbxController extends DurableObject<Env> {
     const backoffUntil = Number(this.getMeta("backoff_until") ?? "0");
     const remaining = backoffUntil - Date.now();
     if (remaining > 0) return Math.min(remaining, SWEEP_INTERVAL_MS);
+    // Not while a pass is running: its own `finally` re-arms once it is done,
+    // and firing now would only bounce off the `reconciling` guard.
+    if (this.rerunRequested && !this.reconciling) return 0;
     return SWEEP_INTERVAL_MS;
   }
 
@@ -438,13 +452,24 @@ export class PbxController extends DurableObject<Env> {
   // ---------------------------------------------------------------------
 
   private async reconcile(forceSweep: boolean): Promise<void> {
-    if (this.reconciling) return; // serialize; the caller's change is picked up by the running pass
-    if (!this.socket()) return;
+    if (this.reconciling) {
+      // Serialize, but don't drop the trigger: the running pass may already
+      // have read its snapshot. A forced sweep is carried over as a sweep.
+      this.rerunRequested = true;
+      if (forceSweep) this.setMeta("needs_sweep", crypto.randomUUID());
+      return;
+    }
+    if (!this.socket()) {
+      // The next connect sweeps anyway; nothing to rerun until then.
+      this.rerunRequested = false;
+      return;
+    }
 
     const backoffUntil = Number(this.getMeta("backoff_until") ?? "0");
     if (!forceSweep && Date.now() < backoffUntil) return;
 
     this.reconciling = true;
+    this.rerunRequested = false;
     try {
       await this.setState("syncing", null);
 
@@ -455,17 +480,24 @@ export class PbxController extends DurableObject<Env> {
         return;
       }
 
-      const desired = await this.loadDesired();
+      const { rows: desired, head } = await this.loadDesired();
 
-      const needSweep =
-        forceSweep || this.getMeta("needs_sweep") === "1" || this.hasCursorGap();
+      const sweepToken = this.getMeta("needs_sweep");
+      const needSweep = forceSweep || sweepToken !== null || this.hasCursorGap();
 
       if (needSweep) {
-        await this.fullSweep(desired);
-        this.ctx.storage.sql.exec("DELETE FROM meta WHERE key = 'needs_sweep'");
+        await this.fullSweep(desired, head);
+        // Only the request this pass answered. A reconnect during the pass
+        // wrote a new token, and its sweep is still owed.
+        if (sweepToken !== null) {
+          this.ctx.storage.sql.exec(
+            "DELETE FROM meta WHERE key = 'needs_sweep' AND value = ?",
+            sweepToken,
+          );
+        }
         this.setMeta("next_sweep_at", String(Date.now() + SWEEP_INTERVAL_MS));
       } else {
-        await this.applyDeltas(desired);
+        await this.applyDeltas(desired, head);
       }
 
       // The pass succeeded, so the PBX now holds this set: record it as the
@@ -610,19 +642,34 @@ export class PbxController extends DurableObject<Env> {
    * successfully pushed, and SCCP stray detection is mirror-minus-desired —
    * refreshing it here would make those two sets identical and silently
    * disable stray deletion for SCCP entirely. See saveMirror().
+   *
+   * Returns the desired set together with the op-log head it corresponds to.
+   * Read in one `batch()` — a single D1 transaction — because the pass acks
+   * ops up to `head` on the strength of having applied `rows`. Reading the head
+   * separately, after a sweep that can take minutes, acked ops committed during
+   * the pass that the stale snapshot never contained: the object was never
+   * pushed, the cursor moved past it, and the PBX reported converged.
+   *
+   * `head` is null in mirror-only mode, where the cursor must not move.
    */
-  private async loadDesired(): Promise<DesiredRow[]> {
+  private async loadDesired(): Promise<{ rows: DesiredRow[]; head: number | null }> {
     try {
-      const res = await this.env.DB.prepare(
-        `SELECT config_class, object_type, object_id, version, attrs_json, dep_rank
-           FROM object_version WHERE pbx_id = ? ORDER BY dep_rank ASC`,
-      )
-        .bind(this.pbxId)
-        .all<DesiredRow>();
-      return res.results ?? [];
+      const [rows, head] = await this.env.DB.batch([
+        this.env.DB.prepare(
+          `SELECT config_class, object_type, object_id, version, attrs_json, dep_rank
+             FROM object_version WHERE pbx_id = ? ORDER BY dep_rank ASC`,
+        ).bind(this.pbxId),
+        this.env.DB.prepare(
+          "SELECT COALESCE(MAX(seq), 0) AS m FROM op_log WHERE pbx_id = ?",
+        ).bind(this.pbxId),
+      ]);
+      return {
+        rows: (rows!.results ?? []) as DesiredRow[],
+        head: Number((head!.results?.[0] as { m: number } | undefined)?.m ?? 0),
+      };
     } catch (e) {
       console.error("pbx: D1 unavailable, using local mirror", e);
-      return this.readMirror();
+      return { rows: this.readMirror(), head: null };
     }
   }
 
@@ -684,7 +731,10 @@ export class PbxController extends DurableObject<Env> {
   // Full sweep
   // ---------------------------------------------------------------------
 
-  private async fullSweep(desired: DesiredRow[]): Promise<void> {
+  private async fullSweep(
+    desired: DesiredRow[],
+    head: number | null,
+  ): Promise<void> {
     await this.validateSccp(desired);
 
     // 1. Converge every desired object.
@@ -700,9 +750,10 @@ export class PbxController extends DurableObject<Env> {
     await this.deletePjsipStrays(desired);
     await this.deleteSccpStrays(desired);
 
-    // A sweep proves the whole desired set is applied, so the cursor can jump
-    // straight to the head of the op log.
-    await this.advanceCursorToHead();
+    // A sweep proves the whole desired *snapshot* is applied, so the cursor can
+    // jump to the op-log head read alongside it — never to the live head, which
+    // may include ops the snapshot predates.
+    if (head !== null) this.setMeta("acked_seq", String(head));
     this.ctx.storage.sql.exec("DELETE FROM meta WHERE key = 'cursor_gap'");
   }
 
@@ -857,13 +908,39 @@ export class PbxController extends DurableObject<Env> {
   // Delta application
   // ---------------------------------------------------------------------
 
-  private async applyDeltas(desired: DesiredRow[]): Promise<void> {
+  /**
+   * Apply ops up to the snapshot `head`, in pages.
+   *
+   * Ops past `head` were committed after the desired snapshot was read, so
+   * their objects may be missing from it (or present in their old form); they
+   * are left for the next pass rather than acked unapplied. Pages loop until
+   * the head is reached — stopping after one page and reporting converged left
+   * a large fan-out (a profile change over thousands of extensions) half
+   * applied until the next hourly sweep.
+   */
+  private async applyDeltas(desired: DesiredRow[], head: number | null): Promise<void> {
+    if (head === null) return; // mirror-only mode: no op log to read
+    let first = true;
+    while (this.ackedSeq < head) {
+      const more = await this.applyDeltaPage(desired, head, first);
+      if (!more) return;
+      first = false;
+    }
+  }
+
+  /** One page of deltas. Returns false when there is nothing (left) to apply. */
+  private async applyDeltaPage(
+    desired: DesiredRow[],
+    head: number,
+    checkGap: boolean,
+  ): Promise<boolean> {
     const since = this.ackedSeq;
     const res = await this.env.DB.prepare(
       `SELECT seq, op, config_class, object_type, object_id
-         FROM op_log WHERE pbx_id = ? AND seq > ? ORDER BY seq ASC LIMIT 5000`,
+         FROM op_log WHERE pbx_id = ? AND seq > ? AND seq <= ?
+        ORDER BY seq ASC LIMIT ${DELTA_PAGE}`,
     )
-      .bind(this.pbxId, since)
+      .bind(this.pbxId, since, head)
       .all<{
         seq: number;
         op: "upsert" | "delete";
@@ -873,7 +950,12 @@ export class PbxController extends DurableObject<Env> {
       }>();
 
     const ops = res.results ?? [];
-    if (ops.length === 0) return;
+    if (ops.length === 0) {
+      // Nothing between the cursor and the snapshot head for this PBX (seq is
+      // global across PBXs), so the cursor can catch up to it.
+      this.setMeta("acked_seq", String(head));
+      return false;
+    }
 
     // Detect a pruned prefix: if the oldest surviving row is already beyond
     // our cursor + 1, rows we needed are gone and only a sweep can prove
@@ -883,10 +965,10 @@ export class PbxController extends DurableObject<Env> {
     )
       .bind(this.pbxId)
       .first<{ m: number | null }>();
-    if (oldest?.m != null && oldest.m > since + 1 && since !== 0) {
+    if (checkGap && oldest?.m != null && oldest.m > since + 1 && since !== 0) {
       this.setMeta("cursor_gap", "1");
-      await this.fullSweep(desired);
-      return;
+      await this.fullSweep(desired, head);
+      return false;
     }
 
     await this.validateSccp(desired);
@@ -944,20 +1026,9 @@ export class PbxController extends DurableObject<Env> {
 
     // Only advance once the whole batch landed. A failure above throws, the
     // cursor stays put, and the retry re-runs the batch idempotently.
-    this.setMeta("acked_seq", String(maxSeq));
-  }
-
-  private async advanceCursorToHead(): Promise<void> {
-    try {
-      const head = await this.env.DB.prepare(
-        "SELECT COALESCE(MAX(seq), 0) AS m FROM op_log WHERE pbx_id = ?",
-      )
-        .bind(this.pbxId)
-        .first<{ m: number }>();
-      this.setMeta("acked_seq", String(head?.m ?? 0));
-    } catch {
-      /* mirror-only mode; cursor stays where it is */
-    }
+    const done = ops.length < DELTA_PAGE;
+    this.setMeta("acked_seq", String(done ? head : maxSeq));
+    return !done;
   }
 
   // ---------------------------------------------------------------------

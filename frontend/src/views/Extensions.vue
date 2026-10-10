@@ -52,6 +52,10 @@ const rangeHint = computed(() => {
   return `Your range is ${id.minExt}–${id.maxExt}.`;
 });
 
+/** Context and overrides decide what a phone can dial and how it presents
+ *  itself, so the server accepts them from admins only. */
+const isAdmin = computed(() => identity.value?.role === "admin");
+
 const techProfiles = computed(() =>
   profiles.value.filter((p) => p.tech === form.value.tech),
 );
@@ -134,7 +138,7 @@ async function saveEdit() {
     const r = await api.updateExtension(e.pbx_id, e.number, {
       display_name: e.display_name,
       profile_id: e.profile_id,
-      context: e.context,
+      ...(isAdmin.value ? { context: e.context } : {}),
       ...(overrides ? { overrides } : {}),
       ...(secretMode.value === "generate" ? { rotate_secret: true } : {}),
       ...(secretMode.value === "manual" ? { secret: supplied } : {}),
@@ -350,6 +354,7 @@ onMounted(load);
         </label>
 
         <Field
+          v-if="isAdmin"
           v-model="form.context"
           label="Dialplan context"
           mono
@@ -392,6 +397,7 @@ onMounted(load);
       <div class="space-y-4">
         <Field v-model="editing.display_name" label="Display name" />
         <Field
+          v-if="isAdmin"
           v-model="editing.context"
           label="Dialplan context"
           mono
@@ -490,7 +496,7 @@ onMounted(load);
           </span>
         </fieldset>
 
-        <label class="block">
+        <label v-if="isAdmin" class="block">
           <span class="mb-1 block text-[11px] tracking-wide text-ink-500 uppercase">
             Attribute overrides
           </span>

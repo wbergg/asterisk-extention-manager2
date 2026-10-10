@@ -70,8 +70,12 @@ function tuples(
 ): Map<string, string> {
   const out = new Map<string, string>();
   for (const src of [base, ...overlays]) {
-    if (!src) continue;
+    if (!src || typeof src !== "object") continue;
     for (const [k, v] of Object.entries(src)) {
+      // Overrides are stored JSON. The API now refuses non-string values, but
+      // one that predates the check must not throw here: a throw in expansion
+      // aborts compilePbx and with it every later write to the whole PBX.
+      if (typeof v !== "string") continue;
       // An explicitly empty override removes the attribute entirely rather
       // than pushing an empty string, which several PJSIP options reject.
       if (v === "") out.delete(k);
@@ -87,7 +91,8 @@ function toTuples(m: Map<string, string>): DesiredTuple[] {
 
 function parseOverrides(json: string): ProfileAttrs {
   try {
-    return JSON.parse(json) as ProfileAttrs;
+    const v: unknown = JSON.parse(json);
+    return typeof v === "object" && v !== null ? (v as ProfileAttrs) : {};
   } catch {
     return {};
   }

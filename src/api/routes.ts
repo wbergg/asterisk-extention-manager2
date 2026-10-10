@@ -32,6 +32,43 @@ export const api = new Hono<{ Bindings: Env; Variables: Vars }>();
 // Middleware
 // ---------------------------------------------------------------------------
 
+/**
+ * Refuse cross-site writes.
+ *
+ * Browser auth is the Access cookie, which the browser attaches to any request
+ * to this origin — including a `<form enctype="text/plain">` POST from another
+ * site whose body happens to be valid JSON, or a body-less `no-cors` fetch to
+ * `/resync`. Neither triggers a preflight, and `c.req.json()` does not care
+ * about Content-Type. So every unsafe method must prove it came from this
+ * origin: `Sec-Fetch-Site` where the browser sends it, `Origin` otherwise.
+ * Non-browser clients (service tokens, curl) send neither and are unaffected.
+ */
+api.use("*", async (c, next) => {
+  const method = c.req.method;
+  if (method === "GET" || method === "HEAD" || method === "OPTIONS") {
+    return next();
+  }
+  const site = c.req.header("Sec-Fetch-Site");
+  if (site && site !== "same-origin" && site !== "none") {
+    return c.json({ error: "cross-site request refused" }, 403);
+  }
+  const origin = c.req.header("Origin");
+  if (origin && origin !== new URL(c.req.url).origin) {
+    return c.json({ error: "cross-site request refused" }, 403);
+  }
+  // A body this API reads is always JSON. Refusing the form encodings closes
+  // the simple-request path even for a browser that sends neither header.
+  const type = c.req.header("Content-Type")?.split(";")[0]?.trim().toLowerCase();
+  if (
+    type === "text/plain" ||
+    type === "application/x-www-form-urlencoded" ||
+    type === "multipart/form-data"
+  ) {
+    return c.json({ error: "request body must be application/json" }, 415);
+  }
+  await next();
+});
+
 api.use("*", async (c, next) => {
   let real: Identity | null;
   try {
@@ -103,6 +140,56 @@ async function syncPbx(
   } catch (e) {
     console.error(`notify ${pbxId} failed`, e);
   }
+}
+
+const NAME_RE = /^[A-Za-z0-9_-]+$/;
+const ATTR_KEY_RE = /^[A-Za-z0-9_.-]{1,64}$/;
+
+/**
+ * Validate an `overrides` body before it is stored.
+ *
+ * Shape matters as much as content: `expand` calls `.replace` on every value,
+ * so a single number or null in one extension's overrides used to throw inside
+ * `compilePbx` and stop every later write to that PBX. Keys are restricted to
+ * the object types this tech expands to, and to attribute names that cannot
+ * carry a newline or section header. `type` belongs to the expansion (and
+ * chan_sccp2 rejects it outright); `password` would duplicate the secret_ref
+ * the DO appends.
+ */
+function badOverrides(
+  ov: unknown,
+  objectTypes: readonly string[],
+): string | null {
+  if (typeof ov !== "object" || ov === null || Array.isArray(ov)) {
+    return "overrides must be an object";
+  }
+  for (const [objType, attrs] of Object.entries(ov)) {
+    if (!objectTypes.includes(objType)) {
+      return `overrides: unknown object "${objType}" (expected ${objectTypes.join(", ")})`;
+    }
+    if (typeof attrs !== "object" || attrs === null || Array.isArray(attrs)) {
+      return `overrides.${objType} must be an object`;
+    }
+    for (const [key, value] of Object.entries(attrs)) {
+      if (!ATTR_KEY_RE.test(key)) {
+        return `overrides.${objType}: invalid attribute name "${key}"`;
+      }
+      if (key === "type" || key === "password") {
+        return `overrides.${objType}.${key} is managed by the expansion`;
+      }
+      if (typeof value !== "string") {
+        return `overrides.${objType}.${key} must be a string`;
+      }
+      if (value.length > 1024 || /[\x00-\x1f\x7f]/.test(value)) {
+        return `overrides.${objType}.${key} is too long or contains control characters`;
+      }
+    }
+  }
+  return null;
+}
+
+function overrideTypesFor(tech: "pjsip" | "sccp"): readonly string[] {
+  return tech === "pjsip" ? ["auth", "aor", "endpoint"] : ["line"];
 }
 
 /** Is this number blocked, or outside the caller's delegated range? */
@@ -232,19 +319,41 @@ api.get("/extensions", async (c) => {
  *
  * Resolved against the PBX's own `dialplan.context` rather than a literal, so
  * renaming the managed context does not leave older extensions behind.
+ *
+ * Only admins may choose anything else. The context decides what a phone can
+ * dial, so a delegated user pointing their own extension at a trunk context is
+ * toll fraud. A non-admin may still resubmit the value already stored
+ * (`current`), because the edit form sends the context back on every save.
  */
 async function resolveContext(
   env: Env,
+  id: Identity,
   pbxId: string,
-  supplied: string | undefined,
+  supplied: unknown,
   host: string,
-): Promise<string> {
-  const trimmed = supplied?.trim();
-  if (trimmed) return trimmed;
+  current: string | null = null,
+): Promise<{ ok: true; context: string } | { ok: false; error: string }> {
+  if (supplied != null && typeof supplied !== "string") {
+    return { ok: false, error: "context must be a string" };
+  }
   const row = await env.DB.prepare("SELECT settings_json FROM pbx WHERE id = ?")
     .bind(pbxId)
     .first<{ settings_json: string }>();
-  return parseSettings(row?.settings_json ?? "", pbxId, host).dialplan.context;
+  const managed = parseSettings(row?.settings_json ?? "", pbxId, host).dialplan
+    .context;
+
+  const trimmed = supplied?.trim();
+  if (!trimmed) return { ok: true, context: managed };
+  if (!NAME_RE.test(trimmed)) {
+    return { ok: false, error: "context must be letters, digits, _ or -" };
+  }
+  if (id.role !== "admin" && trimmed !== managed && trimmed !== current) {
+    return {
+      ok: false,
+      error: `only administrators can set a context other than ${managed}`,
+    };
+  }
+  return { ok: true, context: trimmed };
 }
 
 /**
@@ -287,14 +396,32 @@ api.post("/extensions", async (c) => {
     secret?: string;
   }>();
 
+  if (
+    typeof body.pbx_id !== "string" ||
+    typeof body.number !== "string" ||
+    (body.display_name !== undefined && typeof body.display_name !== "string") ||
+    (body.profile_id != null && typeof body.profile_id !== "string") ||
+    (body.tech !== undefined && body.tech !== "pjsip" && body.tech !== "sccp")
+  ) {
+    return c.json({ error: "malformed request body" }, 400);
+  }
   const pbxId = body.pbx_id;
-  const number = body.number?.trim();
+  const number = body.number.trim();
   if (!pbxId || !number) {
     return c.json({ error: "pbx_id and number are required" }, 400);
   }
 
   const problem = await checkExtensionAllowed(c.env, id, pbxId, number);
   if (problem) return c.json({ error: problem }, 403);
+
+  const ctx = await resolveContext(
+    c.env,
+    id,
+    pbxId,
+    body.context,
+    new URL(c.req.url).host,
+  );
+  if (!ctx.ok) return c.json({ error: ctx.error }, id.role === "admin" ? 400 : 403);
 
   const tech = body.tech ?? "pjsip";
   const directoryOnly = body.directory_only === true;
@@ -330,12 +457,7 @@ api.post("/extensions", async (c) => {
         body.display_name ?? "",
         tech,
         profileId,
-        await resolveContext(
-          c.env,
-          pbxId,
-          body.context,
-          new URL(c.req.url).host,
-        ),
+        ctx.context,
         directoryOnly ? 1 : 0,
         secretEnc,
         id.email,
@@ -347,6 +469,20 @@ api.post("/extensions", async (c) => {
       return c.json({ error: `extension ${number} already exists` }, 409);
     }
     throw e;
+  }
+
+  if (tech === "sccp") {
+    const invalid = await validateSccpForPbx(c.env, pbxId);
+    if (invalid) {
+      // One bad line fails chan_sccp2's whole inventory reload, so it must not
+      // be left behind for the reconciler to trip over.
+      await c.env.DB.prepare(
+        "DELETE FROM extension WHERE pbx_id = ? AND number = ?",
+      )
+        .bind(pbxId, number)
+        .run();
+      return c.json({ error: `SCCP inventory would be invalid: ${invalid}` }, 400);
+    }
   }
 
   await audit(c.env, id, "create_extension", `${pbxId}/${number}`);
@@ -373,7 +509,8 @@ api.put("/extensions/:pbx/:number", async (c) => {
   const number = c.req.param("number");
 
   const existing = await c.env.DB.prepare(
-    `SELECT owner_email, directory_only, tech
+    `SELECT owner_email, directory_only, tech, display_name, profile_id,
+            context, overrides_json, secret_enc
        FROM extension WHERE pbx_id = ? AND number = ?`,
   )
     .bind(pbxId, number)
@@ -381,6 +518,11 @@ api.put("/extensions/:pbx/:number", async (c) => {
       owner_email: string | null;
       directory_only: number;
       tech: "pjsip" | "sccp";
+      display_name: string;
+      profile_id: string | null;
+      context: string;
+      overrides_json: string;
+      secret_enc: string | null;
     }>();
   if (!existing) return c.json({ error: "not found" }, 404);
   if (id.role !== "admin" && existing.owner_email !== id.email) {
@@ -395,6 +537,40 @@ api.put("/extensions/:pbx/:number", async (c) => {
     rotate_secret?: boolean;
     secret?: string;
   }>();
+
+  if (
+    (body.display_name != null && typeof body.display_name !== "string") ||
+    (body.profile_id != null && typeof body.profile_id !== "string")
+  ) {
+    return c.json({ error: "malformed request body" }, 400);
+  }
+
+  // Overrides reach any attribute on the pushed objects — caller-ID trust,
+  // channel variables, a static contact that sends the extension's calls
+  // off-box — so they are an administrator's tool, not a delegated user's.
+  if (body.overrides !== undefined) {
+    if (id.role !== "admin") {
+      return c.json({ error: "only administrators can set overrides" }, 403);
+    }
+    const bad = badOverrides(body.overrides, overrideTypesFor(existing.tech));
+    if (bad) return c.json({ error: bad }, 400);
+  }
+
+  let context: string | null = null;
+  if (body.context !== undefined) {
+    const ctx = await resolveContext(
+      c.env,
+      id,
+      pbxId,
+      body.context,
+      new URL(c.req.url).host,
+      existing.context,
+    );
+    if (!ctx.ok) {
+      return c.json({ error: ctx.error }, id.role === "admin" ? 400 : 403);
+    }
+    context = ctx.context;
+  }
 
   const intent = readSecretIntent(body, existing.directory_only === 1);
   if (intent.kind === "invalid") return c.json({ error: intent.error }, 400);
@@ -442,20 +618,35 @@ api.put("/extensions/:pbx/:number", async (c) => {
       // Absent means "leave it alone"; present-but-blank means "back to the
       // managed context". Passing '' straight through is what silently
       // misrouted the endpoint — see resolveContext.
-      body.context === undefined
-        ? null
-        : await resolveContext(
-            c.env,
-            pbxId,
-            body.context,
-            new URL(c.req.url).host,
-          ),
+      context,
       body.overrides ? JSON.stringify(body.overrides) : null,
       secretEnc,
       pbxId,
       number,
     )
     .run();
+
+  if (existing.tech === "sccp") {
+    const invalid = await validateSccpForPbx(c.env, pbxId);
+    if (invalid) {
+      await c.env.DB.prepare(
+        `UPDATE extension SET display_name = ?, profile_id = ?, context = ?,
+                overrides_json = ?, secret_enc = ?
+          WHERE pbx_id = ? AND number = ?`,
+      )
+        .bind(
+          existing.display_name,
+          existing.profile_id,
+          existing.context,
+          existing.overrides_json,
+          existing.secret_enc,
+          pbxId,
+          number,
+        )
+        .run();
+      return c.json({ error: `SCCP inventory would be invalid: ${invalid}` }, 400);
+    }
+  }
 
   await audit(c.env, id, "update_extension", `${pbxId}/${number}`);
   // A credential change gets its own action rather than hiding inside a generic
@@ -856,7 +1047,6 @@ api.get("/admin/pbx/:id/settings", async (c) => {
   );
 });
 
-const NAME_RE = /^[A-Za-z0-9_-]+$/;
 
 function badSettings(s: PbxSettings): string | null {
   let uri: URL;
@@ -1074,6 +1264,17 @@ api.delete("/admin/pbx/:id/quarantine/:class/:type/:objectId", async (c) => {
     .run();
 
   if ((res.meta.changes ?? 0) === 0) return c.json({ error: "not found" }, 404);
+
+  // The cursor already moved past this object's op while it was being skipped,
+  // so a delta pass would find nothing to retry and report "converged" with
+  // the object still unapplied. A fresh upsert op puts it back in the stream.
+  await touchObject(
+    c.env.DB,
+    pbxId,
+    c.req.param("class"),
+    c.req.param("type"),
+    c.req.param("objectId"),
+  );
 
   await audit(
     c.env,
@@ -1457,6 +1658,10 @@ api.post("/admin/sccp/devices", async (c) => {
   if (!DEVICE_ID_RE.test(sepId)) {
     return c.json({ error: "sep_id must be SEP followed by 12 hex digits" }, 400);
   }
+  if (body.overrides !== undefined) {
+    const bad = badOverrides(body.overrides, ["device"]);
+    if (bad) return c.json({ error: bad }, 400);
+  }
 
   const buttons = body.buttons ?? [];
   const buttonProblem = badButtons(buttons);
@@ -1534,6 +1739,10 @@ api.put("/admin/sccp/devices/:pbx/:sepId", async (c) => {
   if (body.buttons) {
     const problem = badButtons(body.buttons);
     if (problem) return c.json({ error: problem }, 400);
+  }
+  if (body.overrides !== undefined) {
+    const bad = badOverrides(body.overrides, ["device"]);
+    if (bad) return c.json({ error: bad }, 400);
   }
 
   // Snapshot for rollback: chan_sccp2 reloads the whole inventory on any write,
