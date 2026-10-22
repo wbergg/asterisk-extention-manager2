@@ -396,6 +396,8 @@ export async function renderBundle(
     );
   }
 
+  await recordFileHashes(db, pbxId, fileRev, files);
+
   const signature = await signBundle(
     env.BUNDLE_KEY,
     files.map((f) => `${f.path}\n${f.content}`).join("\n---\n"),
@@ -408,4 +410,104 @@ export async function renderBundle(
     signature,
     generatedAt: new Date().toISOString(),
   };
+}
+
+/**
+ * The content of a rendered file with its revision stamp removed, so two
+ * revisions of an otherwise unchanged file hash the same. The stamp appears in
+ * every banner and, for extensions.conf, as the AEM_FILE_REV global.
+ */
+function withoutRevision(content: string): string {
+  return content
+    .replace(/file revision \d+/g, "file revision N")
+    .replace(/^AEM_FILE_REV = \d+$/m, "AEM_FILE_REV = N");
+}
+
+/**
+ * Remember what each file of this revision looked like. Best effort: a missing
+ * table (migration 0004 not yet applied) must not stop the bundle from being
+ * served — the only cost is a less specific stale message.
+ */
+async function recordFileHashes(
+  db: D1Database,
+  pbxId: string,
+  fileRev: number,
+  files: RenderedFile[],
+): Promise<void> {
+  try {
+    const rows = await Promise.all(
+      files.map(async (f) => ({
+        path: f.path,
+        hash: await sha256Hex(withoutRevision(f.content)),
+      })),
+    );
+    await db.batch(
+      rows.map((r) =>
+        db
+          .prepare(
+            `INSERT OR REPLACE INTO bundle_file_hash (pbx_id, file_rev, path, content_hash)
+             VALUES (?, ?, ?, ?)`,
+          )
+          .bind(pbxId, fileRev, r.path, r.hash),
+      ),
+    );
+  } catch (e) {
+    console.error(`bundle: could not record file hashes for ${pbxId}@${fileRev}`, e);
+  }
+}
+
+export interface StaleFiles {
+  /** New or changed since the applied revision: install these. */
+  changed: string[];
+  /** Shipped in the applied revision but no longer generated: remove these. */
+  removed: string[];
+}
+
+/**
+ * Which files differ between the revision the PBX has applied and the one AEM
+ * wants. Null when either revision was never recorded (rendered before
+ * migration 0004, or never rendered at all), so the caller falls back to
+ * "apply the whole bundle".
+ */
+export async function staleFiles(
+  db: D1Database,
+  pbxId: string,
+  appliedRev: number,
+  desiredRev: number,
+): Promise<StaleFiles | null> {
+  try {
+    const res = await db
+      .prepare(
+        `SELECT file_rev, path, content_hash FROM bundle_file_hash
+          WHERE pbx_id = ? AND file_rev IN (?, ?)`,
+      )
+      .bind(pbxId, appliedRev, desiredRev)
+      .all<{ file_rev: number; path: string; content_hash: string }>();
+    const applied = new Map<string, string>();
+    const desired = new Map<string, string>();
+    for (const r of res.results ?? []) {
+      (r.file_rev === appliedRev ? applied : desired).set(r.path, r.content_hash);
+    }
+    if (applied.size === 0 || desired.size === 0) return null;
+
+    return {
+      changed: [...desired].filter(([p, h]) => applied.get(p) !== h).map(([p]) => p),
+      removed: [...applied.keys()].filter((p) => !desired.has(p)),
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** The middle sentence of the stale status: what to install, what to remove. */
+export function describeStale(stale: StaleFiles | null): string {
+  if (!stale) {
+    return "Which files changed is unknown (that revision was never recorded), so install every file.";
+  }
+  const parts: string[] = [];
+  if (stale.changed.length) parts.push(`Changed: ${stale.changed.join(", ")}.`);
+  if (stale.removed.length) parts.push(`No longer generated, remove: ${stale.removed.join(", ")}.`);
+  // Only the revision stamp moved, e.g. an input changed and was changed back.
+  if (!parts.length) parts.push("No file content changed, only the revision stamp; installing extensions.conf is enough.");
+  return parts.join(" ");
 }

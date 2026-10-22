@@ -14,6 +14,7 @@ import {
 import { decryptSecret } from "../lib/crypto.js";
 import { ingestChannelEvent } from "./calllog.js";
 import { validateSccpInventory } from "../model/sccp/validate.js";
+import { describeStale, staleFiles } from "../render/bundle.js";
 import {
   isSecretTuple,
   type ConfigClass,
@@ -604,9 +605,13 @@ export class PbxController extends DurableObject<Env> {
       const observed = value === "" ? null : Number(value);
       this.setMeta("observed_file_rev", observed === null ? "" : String(observed));
       if (pbx && observed !== pbx.file_rev) {
+        const stale =
+          observed === null
+            ? null
+            : await staleFiles(this.env.DB, pbx.id, observed, pbx.file_rev);
         return `config bundle is stale: PBX has AEM_FILE_REV=${
           observed ?? "(unset)"
-        }, desired is ${pbx.file_rev}. Apply the bundle from /api/pbx/${
+        }, desired is ${pbx.file_rev}. ${describeStale(stale)} Apply the bundle from /api/pbx/${
           pbx.id
         }/config-bundle.`;
       }
