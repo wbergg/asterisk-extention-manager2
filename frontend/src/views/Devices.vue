@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
+import { computed, onMounted, reactive, ref } from "vue";
 
 import {
   api,
@@ -249,6 +249,30 @@ function setArgs(b: SccpButton, text: string) {
     .split(",")
     .map((s) => s.trim())
     .filter((s) => s.length > 0);
+  checks.delete(b);
+}
+
+/**
+ * Per-button "Check" results, keyed by the button row itself so they follow it
+ * through reordering. Any edit to the row drops its result: a green tick must
+ * only ever describe the text currently in the field.
+ */
+const checks = reactive(
+  new Map<SccpButton, { busy: boolean; ok?: boolean; error?: string }>(),
+);
+
+async function checkButton(b: SccpButton) {
+  const f = editing.value;
+  if (!f) return;
+  checks.set(b, { busy: true });
+  try {
+    const r = await api.checkSccpButton({ pbx_id: f.pbx_id, kind: b.kind, args: b.args });
+    // Edited while the request was in flight: the answer is for old text.
+    if (!checks.get(b)?.busy) return;
+    checks.set(b, { busy: false, ok: r.ok, ...(r.error ? { error: r.error } : {}) });
+  } catch (e) {
+    checks.set(b, { busy: false, ok: false, error: errorText(e) });
+  }
 }
 
 const hintFor = (kind: string) =>
@@ -595,6 +619,7 @@ onMounted(load);
               </span>
               <select
                 v-model="b.kind"
+                @change="checks.delete(b)"
                 class="w-40 shrink-0 rounded-sm border border-panel-600 bg-panel-900 px-2 py-1 text-xs text-ink-100"
               >
                 <option v-for="k in BUTTON_KINDS" :key="k.kind" :value="k.kind">
@@ -608,6 +633,20 @@ onMounted(load);
                 @input="setArgs(b, ($event.target as HTMLInputElement).value)"
               />
               <div class="flex shrink-0 gap-1">
+                <Btn
+                  :busy="checks.get(b)?.busy"
+                  :class="
+                    checks.get(b)?.ok === true
+                      ? '!border-ok-400/40 !bg-ok-400/10 !text-ok-400'
+                      : checks.get(b)?.ok === false
+                        ? '!border-bad-400/40 !text-bad-400'
+                        : ''
+                  "
+                  :title="checks.get(b)?.ok ? 'chan_sccp2 will accept this button' : 'Check this button against the chan_sccp2 parser'"
+                  @click="checkButton(b)"
+                >
+                  {{ checks.get(b)?.ok === true ? "✓ Valid" : checks.get(b)?.ok === false ? "✕ Check" : "Check" }}
+                </Btn>
                 <Btn :disabled="i === 0" @click="moveButton(i, -1)">↑</Btn>
                 <Btn
                   :disabled="i === editing.buttons.length - 1"
@@ -618,7 +657,10 @@ onMounted(load);
                 <Btn variant="danger" @click="removeButton(i)">✕</Btn>
               </div>
             </div>
-            <p class="ident mt-1 pl-12 text-[11px] text-ink-500">
+            <p v-if="checks.get(b)?.error" class="mt-1 pl-12 text-[11px] text-bad-400">
+              {{ checks.get(b)?.error }}
+            </p>
+            <p v-else class="ident mt-1 pl-12 text-[11px] text-ink-500">
               {{ hintFor(b.kind) }}
             </p>
           </div>

@@ -12,6 +12,8 @@ const rows = ref<AppUser[]>([]);
 const loading = ref(true);
 const editing = ref<AppUser | null>(null);
 const isNew = ref(false);
+/** The row's email as persisted, so a changed email is sent as a rename. */
+const originalEmail = ref("");
 const saving = ref(false);
 const removing = ref<string | null>(null);
 
@@ -56,11 +58,13 @@ async function load() {
 function add() {
   editing.value = blank();
   isNew.value = true;
+  originalEmail.value = "";
 }
 
 function edit(u: AppUser) {
   editing.value = { ...u };
   isNew.value = false;
+  originalEmail.value = u.email;
 }
 
 async function save() {
@@ -84,6 +88,7 @@ async function save() {
       min_ext: u.min_ext === null || u.min_ext === ("" as never) ? null : Number(u.min_ext),
       max_ext: u.max_ext === null || u.max_ext === ("" as never) ? null : Number(u.max_ext),
       call_log_access: u.call_log_access === 1 || (u.call_log_access as unknown) === true,
+      previous_email: isNew.value ? undefined : originalEmail.value,
     });
     notify("ok", `Saved ${u.email}`);
     editing.value = null;
@@ -119,7 +124,7 @@ async function remove(email: string) {
         ? `Removed ${email} — ${r.orphanedExtensions} extension(s) now unowned`
         : `Removed ${email}`,
     );
-    if (editing.value?.email === email) editing.value = null;
+    if (editing.value && originalEmail.value === email) editing.value = null;
     await load();
   } catch (e) {
     notify("bad", errorText(e));
@@ -222,7 +227,7 @@ onMounted(load);
 
     <Modal
       v-if="editing"
-      :title="isNew ? 'Add user' : `Edit ${editing.email}`"
+      :title="isNew ? 'Add user' : `Edit ${originalEmail}`"
       @close="editing = null"
     >
       <div class="space-y-4">
@@ -230,9 +235,13 @@ onMounted(load);
           v-model="editing.email"
           label="Email"
           mono
-          :readonly="!isNew"
+          :readonly="!isNew && originalEmail === identity?.email"
           placeholder="name@example.com"
-          hint="Must match exactly what your identity provider asserts."
+          :hint="
+            !isNew && originalEmail === identity?.email
+              ? 'You cannot change the email of your own account.'
+              : 'Must match exactly what your identity provider asserts. Changing it moves their extensions to the new address.'
+          "
         />
         <Field v-model="editing.display_name" label="Display name" />
 
@@ -274,10 +283,10 @@ onMounted(load);
           v-if="!isNew"
           variant="danger"
           class="mr-auto"
-          :disabled="blockedReason(editing.email) !== null"
-          :busy="removing === editing.email"
-          :title="blockedReason(editing.email) ?? `Remove ${editing.email}`"
-          @click="remove(editing.email)"
+          :disabled="blockedReason(originalEmail) !== null"
+          :busy="removing === originalEmail"
+          :title="blockedReason(originalEmail) ?? `Remove ${originalEmail}`"
+          @click="remove(originalEmail)"
         >
           Remove
         </Btn>

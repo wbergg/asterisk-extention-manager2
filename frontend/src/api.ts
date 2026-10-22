@@ -360,6 +360,9 @@ export const api = {
       `/admin/sccp/devices/${encodeURIComponent(pbx)}/${encodeURIComponent(sepId)}`,
       body,
     ),
+  /** Parse one button as chan_sccp2 would, without saving. */
+  checkSccpButton: (body: { pbx_id: string; kind: string; args: string[] }) =>
+    post<{ ok: boolean; error?: string }>("/admin/sccp/buttons/check", body),
   deleteSccpDevice: (pbx: string, sepId: string) =>
     del<{ ok: boolean }>(
       `/admin/sccp/devices/${encodeURIComponent(pbx)}/${encodeURIComponent(sepId)}`,

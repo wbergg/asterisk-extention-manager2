@@ -13,6 +13,7 @@ import {
   validateSecret,
 } from "../lib/crypto.js";
 import { buildDesired, compilePbx, touchObject } from "../model/compile.js";
+import { buttonProblem } from "../model/sccp/button.js";
 import { BUTTON_KINDS, DEVICE_ID_RE } from "../model/sccp/options.js";
 import { validateSccpInventory } from "../model/sccp/validate.js";
 import { renderBundle } from "../render/bundle.js";
@@ -536,13 +537,24 @@ api.put("/extensions/:pbx/:number", async (c) => {
     overrides?: Record<string, unknown>;
     rotate_secret?: boolean;
     secret?: string;
+    tech?: "pjsip" | "sccp";
   }>();
 
   if (
     (body.display_name != null && typeof body.display_name !== "string") ||
-    (body.profile_id != null && typeof body.profile_id !== "string")
+    (body.profile_id != null && typeof body.profile_id !== "string") ||
+    (body.tech !== undefined && body.tech !== "pjsip" && body.tech !== "sccp")
   ) {
     return c.json({ error: "malformed request body" }, 400);
+  }
+
+  // Changing technology migrates a number between PJSIP and SCCP in place,
+  // keeping its number, owner, context and secret. Admin-only: SCCP lines are
+  // only reachable through devices, which are an administrator's inventory.
+  const tech = body.tech ?? existing.tech;
+  const techChanged = tech !== existing.tech;
+  if (techChanged && id.role !== "admin") {
+    return c.json({ error: "only administrators can change the technology" }, 403);
   }
 
   // Overrides reach any attribute on the pushed objects — caller-ID trust,
@@ -552,7 +564,7 @@ api.put("/extensions/:pbx/:number", async (c) => {
     if (id.role !== "admin") {
       return c.json({ error: "only administrators can set overrides" }, 403);
     }
-    const bad = badOverrides(body.overrides, overrideTypesFor(existing.tech));
+    const bad = badOverrides(body.overrides, overrideTypesFor(tech));
     if (bad) return c.json({ error: bad }, 400);
   }
 
@@ -583,19 +595,38 @@ api.put("/extensions/:pbx/:number", async (c) => {
   // treated as a value and silently emptied the column. Here it went the other
   // way — the GUI sends its "none" option as null, COALESCE read that as
   // absent, and choosing none quietly kept the profile it was meant to remove.
-  const profileGiven = body.profile_id !== undefined;
+  //
+  // A technology change always rewrites the profile: the old one belongs to the
+  // other technology and could not be used, so absent means "none" there.
+  const profileGiven = body.profile_id !== undefined || techChanged;
   const profileId = profileGiven ? body.profile_id?.trim() || null : null;
   if (profileGiven) {
-    const problem = await checkProfile(c.env, profileId, existing.tech);
+    const problem = await checkProfile(c.env, profileId, tech);
     if (problem) return c.json({ error: problem }, 400);
   }
+  // Likewise the overrides: they are keyed by the old technology's object
+  // types, which the new expansion would reject.
+  const overridesJson = body.overrides
+    ? JSON.stringify(body.overrides)
+    : techChanged
+      ? "{}"
+      : null;
 
   // Revealed only when generated here. A supplied secret is one the caller
   // already holds, so returning it would put a credential back on the wire
   // (and on screen) for nothing.
   let newSecret: string | null = null;
   let secretEnc: string | null = null;
-  if (intent.kind === "generate") {
+  //
+  // A number becoming PJSIP with no stored secret would push an auth object
+  // with no password, so one is generated exactly as on create.
+  const needsSecret =
+    techChanged &&
+    tech === "pjsip" &&
+    existing.directory_only !== 1 &&
+    existing.secret_enc === null &&
+    intent.kind === "keep";
+  if (intent.kind === "generate" || needsSecret) {
     newSecret = generateSecret();
     secretEnc = await encryptSecret(c.env.SECRET_KEY, newSecret);
   } else if (intent.kind === "supplied") {
@@ -604,6 +635,7 @@ api.put("/extensions/:pbx/:number", async (c) => {
 
   await c.env.DB.prepare(
     `UPDATE extension SET
+       tech           = ?,
        display_name   = COALESCE(?, display_name),
        profile_id     = CASE WHEN ? = 1 THEN ? ELSE profile_id END,
        context        = COALESCE(?, context),
@@ -612,6 +644,7 @@ api.put("/extensions/:pbx/:number", async (c) => {
      WHERE pbx_id = ? AND number = ?`,
   )
     .bind(
+      tech,
       body.display_name ?? null,
       profileGiven ? 1 : 0,
       profileId,
@@ -619,22 +652,25 @@ api.put("/extensions/:pbx/:number", async (c) => {
       // managed context". Passing '' straight through is what silently
       // misrouted the endpoint — see resolveContext.
       context,
-      body.overrides ? JSON.stringify(body.overrides) : null,
+      overridesJson,
       secretEnc,
       pbxId,
       number,
     )
     .run();
 
-  if (existing.tech === "sccp") {
+  // Leaving SCCP is validated too: a device whose line button still names this
+  // number would otherwise reference a line that no longer exists.
+  if (existing.tech === "sccp" || tech === "sccp") {
     const invalid = await validateSccpForPbx(c.env, pbxId);
     if (invalid) {
       await c.env.DB.prepare(
-        `UPDATE extension SET display_name = ?, profile_id = ?, context = ?,
+        `UPDATE extension SET tech = ?, display_name = ?, profile_id = ?, context = ?,
                 overrides_json = ?, secret_enc = ?
           WHERE pbx_id = ? AND number = ?`,
       )
         .bind(
+          existing.tech,
           existing.display_name,
           existing.profile_id,
           existing.context,
@@ -648,7 +684,12 @@ api.put("/extensions/:pbx/:number", async (c) => {
     }
   }
 
-  await audit(c.env, id, "update_extension", `${pbxId}/${number}`);
+  await audit(
+    c.env,
+    id,
+    "update_extension",
+    `${pbxId}/${number}${techChanged ? ` (tech ${existing.tech}→${tech})` : ""}`,
+  );
   // A credential change gets its own action rather than hiding inside a generic
   // update, so the audit view can be read for "who changed a password".
   if (intent.kind !== "keep") {
@@ -665,7 +706,9 @@ api.put("/extensions/:pbx/:number", async (c) => {
   // Only PJSIP carries the secret into pushed config: chan_sccp2 lines
   // authenticate by device, so an SCCP secret is stored but has no auth object
   // to re-push. The auth object's sorcery id is the bare extension number.
-  const pushSecret = intent.kind !== "keep" && existing.tech === "pjsip";
+  // After a technology change the auth object is new anyway, so it needs no
+  // separate touch.
+  const pushSecret = intent.kind !== "keep" && tech === "pjsip" && !techChanged;
   if (pushSecret) {
     await touchObject(c.env.DB, pbxId, "res_pjsip", "auth", number);
   }
@@ -1306,6 +1349,8 @@ api.post("/admin/users", async (c) => {
     min_ext?: number;
     max_ext?: number;
     call_log_access?: boolean;
+    /** Set when editing: the row's current email, so the email can change. */
+    previous_email?: string;
   }>();
 
   const email = body.email?.trim().toLowerCase();
@@ -1316,6 +1361,47 @@ api.post("/admin/users", async (c) => {
     body.min_ext > body.max_ext
   ) {
     return c.json({ error: "min_ext must not exceed max_ext" }, 400);
+  }
+
+  const previous = body.previous_email?.trim().toLowerCase();
+  if (previous && previous !== email) {
+    // Renaming the principal you are signed in as would strand you: Access
+    // keeps asserting the old address, which no longer has a row.
+    if (
+      previous === id.email.toLowerCase() ||
+      previous === id.impersonatedBy?.toLowerCase()
+    ) {
+      return c.json({ error: "you cannot change the email of your own account" }, 400);
+    }
+    const [old, clash] = await Promise.all([
+      c.env.DB.prepare("SELECT 1 FROM app_user WHERE email = ?").bind(previous).first(),
+      c.env.DB.prepare("SELECT 1 FROM app_user WHERE email = ?").bind(email).first(),
+    ]);
+    if (!old) return c.json({ error: "not found" }, 404);
+    if (clash) return c.json({ error: `${email} already exists` }, 409);
+
+    // owner_email is an ACL keyed on the address, so the user's extensions
+    // move with them. One batch so a failure leaves neither half applied.
+    await c.env.DB.batch([
+      c.env.DB.prepare(
+        `UPDATE app_user SET email = ?, role = ?, display_name = ?, min_ext = ?,
+           max_ext = ?, call_log_access = ? WHERE email = ?`,
+      ).bind(
+        email,
+        body.role ?? "user",
+        body.display_name ?? "",
+        body.min_ext ?? null,
+        body.max_ext ?? null,
+        body.call_log_access ? 1 : 0,
+        previous,
+      ),
+      c.env.DB.prepare("UPDATE extension SET owner_email = ? WHERE owner_email = ?").bind(
+        email,
+        previous,
+      ),
+    ]);
+    await audit(c.env, id, "rename_user", `${previous} -> ${email}`);
+    return c.json({ ok: true });
   }
 
   await c.env.DB.prepare(
@@ -1574,14 +1660,41 @@ function badButtons(buttons: ButtonInput[]): string | null {
     if (seen.has(b.position)) return `duplicate button position ${b.position}`;
     seen.add(b.position);
     if (!(b.kind in BUTTON_KINDS)) return `unknown button kind "${b.kind}"`;
-    // minArgs counts the kind itself, so the args array carries one fewer.
-    const min = BUTTON_KINDS[b.kind as keyof typeof BUTTON_KINDS].minArgs - 1;
-    if (b.args.length < min) {
-      return `button kind "${b.kind}" needs at least ${min} argument(s)`;
-    }
+    // Syntax only: whether a line button names a real line is a cross-object
+    // check, which validateSccpForPbx makes against the whole inventory.
+    const problem = buttonProblem(b.kind, b.args);
+    if (problem) return `button ${b.position}: ${problem}`;
   }
   return null;
 }
+
+/**
+ * Check one button as chan_sccp2 would parse it, without saving anything —
+ * the device form's per-button "Check". Unlike save, this also resolves a line
+ * button against the PBX's SCCP lines, so a missing or still-PJSIP number is
+ * caught while the operator is looking at it.
+ */
+api.post("/admin/sccp/buttons/check", async (c) => {
+  const body = await c.req.json<{ pbx_id?: string; kind?: string; args?: unknown }>();
+  if (
+    typeof body.pbx_id !== "string" ||
+    typeof body.kind !== "string" ||
+    !Array.isArray(body.args) ||
+    !body.args.every((a) => typeof a === "string")
+  ) {
+    return c.json({ error: "malformed request body" }, 400);
+  }
+
+  const res = await c.env.DB.prepare(
+    "SELECT number FROM extension WHERE pbx_id = ? AND tech = 'sccp' AND directory_only = 0",
+  )
+    .bind(body.pbx_id)
+    .all<{ number: string }>();
+  const lines = new Set((res.results ?? []).map((r) => r.number));
+
+  const problem = buttonProblem(body.kind, body.args as string[], lines);
+  return c.json(problem ? { ok: false, error: problem } : { ok: true });
+});
 
 async function replaceButtons(
   env: Env,

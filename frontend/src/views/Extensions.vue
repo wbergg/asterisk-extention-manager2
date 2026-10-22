@@ -32,6 +32,8 @@ const form = ref({
 /** Per-extension attribute overlay, edited as JSON — the escape hatch for the
  *  one endpoint in twenty that needs a setting its profile does not carry. */
 const editing = ref<Extension | null>(null);
+/** The persisted technology, so a change in the dialog is sent as a migration. */
+const editingTech = ref<"pjsip" | "sccp">("pjsip");
 const overridesText = ref("");
 const editSaving = ref(false);
 
@@ -106,6 +108,7 @@ function openCreate() {
 
 function openEdit(e: Extension) {
   editing.value = { ...e };
+  editingTech.value = e.tech;
   overridesText.value = "";
   editSaving.value = false;
   secretMode.value = "keep";
@@ -139,6 +142,7 @@ async function saveEdit() {
       display_name: e.display_name,
       profile_id: e.profile_id,
       ...(isAdmin.value ? { context: e.context } : {}),
+      ...(e.tech !== editingTech.value ? { tech: e.tech } : {}),
       ...(overrides ? { overrides } : {}),
       ...(secretMode.value === "generate" ? { rotate_secret: true } : {}),
       ...(secretMode.value === "manual" ? { secret: supplied } : {}),
@@ -146,6 +150,9 @@ async function saveEdit() {
     // Sticky, as on create: a generated secret is shown exactly once and has to
     // survive long enough to reach the phone's config.
     if (r.secret) notify("ok", `Saved ${e.number} — new SIP secret:`, r.secret);
+    else if (e.tech !== editingTech.value) {
+      notify("ok", `Saved ${e.number} — now ${e.tech}. Re-apply the config bundle so the dialplan follows.`);
+    }
     else if (secretMode.value === "manual") {
       notify("ok", `Saved ${e.number} — secret updated`);
     } else notify("ok", `Saved ${e.number}`);
@@ -403,6 +410,28 @@ onMounted(load);
           mono
           hint="Where calls from this phone land."
         />
+
+        <label v-if="isAdmin" class="block">
+          <span class="mb-1 block text-[11px] tracking-wide text-ink-500 uppercase">
+            Technology
+          </span>
+          <select
+            v-model="editing.tech"
+            class="w-full rounded-sm border border-panel-600 bg-panel-950 px-2.5 py-1.5 text-sm text-ink-100 focus:border-accent-400/60"
+            @change="editing.profile_id = null"
+          >
+            <option value="pjsip">PJSIP</option>
+            <option value="sccp">SCCP (Cisco)</option>
+          </select>
+          <span v-if="editing.tech !== editingTech" class="mt-1 block text-[11px] text-warn-400">
+            Migrates {{ editing.number }} from {{ editingTech }} to {{ editing.tech }}:
+            the old objects are removed from the PBX and the profile and overrides
+            are reset, so pick a {{ editing.tech }} profile below.
+            <template v-if="editing.tech === 'sccp'">
+              Add a line button for it on a device to make it ring.
+            </template>
+          </span>
+        </label>
 
         <label class="block">
           <span class="mb-1 block text-[11px] tracking-wide text-ink-500 uppercase">
